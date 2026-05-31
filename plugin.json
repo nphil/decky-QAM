@@ -1,0 +1,11 @@
+{
+  "name": "decky-QAM",
+  "author": "nphil",
+  "flags": ["_root"],
+  "api_version": 1,
+  "publish": {
+    "tags": ["input", "utility", "system"],
+    "description": "Remap the Quick Access Menu to a back grip button (L4/L5/R4/R5). For Steam Decks whose QAM (\"...\") hardware button is broken.",
+    "image": "https://raw.githubusercontent.com/nphil/decky-qam/main/assets/thumbnail.png"
+  }
+}
