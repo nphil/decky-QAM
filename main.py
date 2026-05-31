@@ -5,16 +5,18 @@ import os
 import select
 import threading
 import time
+from collections import deque
 
 import decky
 
-# Valve vendor id; Steam Deck (LCD + OLED) built-in controller product id.
+# Valve vendor id. The built-in Steam Deck controller exposes several HID
+# interfaces under this vendor; we read them all and key off report length.
 VALVE_VID = "28DE"
-DECK_PIDS = ("1205",)
-REPORT_LEN = 64
-# DeckState input report carries the button bits. Other report types
-# (haptics acks, etc.) are ignored so the bit layout stays consistent.
-DECK_STATE_REPORT_TYPE = 0x09
+# DeckState input report is 64 bytes; that is our discriminator.
+STATE_LEN = 64
+# Digital buttons live in this byte window. Gyro/accel start around byte 16
+# and analog sticks/triggers later still, so we stay clear of them.
+BUTTON_REGION = range(8, 16)
 
 SETTINGS_FILE = "settings.json"
 
@@ -39,23 +41,22 @@ def save_settings(data: dict) -> None:
     os.replace(tmp, _settings_path())
 
 
-def find_deck_hidraw() -> str | None:
-    """Locate the /dev/hidraw node for the built-in Steam Deck controller."""
+def find_valve_hidraw() -> list[str]:
+    """All /dev/hidraw* nodes that belong to a Valve (Steam Deck) device."""
+    found = []
     for path in sorted(glob.glob("/dev/hidraw*")):
         name = os.path.basename(path)
-        uevent = f"/sys/class/hidraw/{name}/device/uevent"
         try:
-            with open(uevent, "r") as f:
+            with open(f"/sys/class/hidraw/{name}/device/uevent", "r") as f:
                 data = f.read().upper()
         except OSError:
             continue
-        if VALVE_VID in data and any(pid in data for pid in DECK_PIDS):
-            return path
-    return None
+        if VALVE_VID in data:
+            found.append(path)
+    return found
 
 
 def report_matches(report: bytes, conditions: list[dict]) -> bool:
-    """True when every (byte, mask) bit in the saved trigger is set."""
     if not conditions:
         return False
     for cond in conditions:
@@ -66,16 +67,23 @@ def report_matches(report: bytes, conditions: list[dict]) -> bool:
     return True
 
 
+def _region_bits(report: bytes) -> set[int]:
+    bits = set()
+    for idx in BUTTON_REGION:
+        if idx >= len(report):
+            break
+        byte = report[idx]
+        for bit in range(8):
+            if byte & (1 << bit):
+                bits.add(idx * 8 + bit)
+    return bits
+
+
 class HidListener:
     """
-    Reads raw DeckState HID reports on a background thread.
-
-    Two jobs:
-      * runtime  - watch for the bound back-button signature and, on a
-                   rising edge, ask the frontend to open the QAM.
-      * capture  - "learn" the bit signature of whichever button the user
-                   presses, so we never have to hard-code per-revision
-                   bit offsets.
+    Reads raw DeckState HID reports from every Valve HID node on a background
+    thread. Detects the bound back-button (runtime) and learns a button's bit
+    signature via a press-to-bind capture flow.
     """
 
     def __init__(self, loop: asyncio.AbstractEventLoop):
@@ -86,34 +94,43 @@ class HidListener:
 
         self.trigger: list[dict] = []
         self.was_pressed = False
-        self.device_path: str | None = None
+        self.devices: list[str] = []
+
+        # diagnostics
+        self.stats: dict[str, dict] = {}
+        self.recent: deque[str] = deque(maxlen=8)
 
         # capture state machine
         self._capturing = False
-        self._capture_phase = ""        # "baseline" | "wait_press" | "confirm"
-        self._baseline_zero: set[int] | None = None  # bit indexes that stayed 0
+        self._capture_phase = ""
+        self._baseline_zero: set[int] | None = None
         self._press_bits: set[int] | None = None
         self._phase_deadline = 0.0
-        self._capture_samples = 0
+        self._confirm_samples = 0
+        self._capture_start = 0.0
+        self._capture_reports = 0
 
-    # ---- public control --------------------------------------------------
+    # ---- control ---------------------------------------------------------
 
     def set_trigger(self, conditions: list[dict]) -> None:
         with self._lock:
             self.trigger = conditions or []
             self.was_pressed = False
 
+    def is_running(self) -> bool:
+        return bool(self._thread and self._thread.is_alive())
+
     def start(self) -> bool:
-        if self._thread and self._thread.is_alive():
+        if self.is_running():
             return True
-        self.device_path = find_deck_hidraw()
-        if not self.device_path:
-            decky.logger.warning("decky-QAM: no Steam Deck hidraw device found")
+        self.devices = find_valve_hidraw()
+        if not self.devices:
+            decky.logger.warning("decky-QAM: no Valve HID device found")
             return False
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
-        decky.logger.info("decky-QAM: listening on %s", self.device_path)
+        decky.logger.info("decky-QAM: listening on %s", self.devices)
         return True
 
     def stop(self) -> None:
@@ -129,7 +146,9 @@ class HidListener:
             self._capture_phase = "baseline"
             self._baseline_zero = None
             self._press_bits = None
-            self._capture_samples = 0
+            self._confirm_samples = 0
+            self._capture_start = time.monotonic()
+            self._capture_reports = 0
             self._phase_deadline = time.monotonic() + 1.0
 
     def cancel_capture(self) -> None:
@@ -137,76 +156,103 @@ class HidListener:
             self._capturing = False
             self._capture_phase = ""
 
+    def diagnostics(self) -> dict:
+        return {
+            "devices": [
+                {
+                    "path": p,
+                    "reports": self.stats.get(p, {}).get("count", 0),
+                    "last_len": self.stats.get(p, {}).get("last_len", 0),
+                }
+                for p in self.devices
+            ],
+            "recent": list(self.recent),
+            "running": self.is_running(),
+        }
+
     # ---- worker ----------------------------------------------------------
 
     def _run(self) -> None:
-        try:
-            fd = os.open(self.device_path, os.O_RDONLY | os.O_NONBLOCK)
-        except OSError as e:
-            decky.logger.error("decky-QAM: cannot open %s: %s", self.device_path, e)
+        fdmap: dict[int, str] = {}
+        for path in self.devices:
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+                fdmap[fd] = path
+                self.stats[path] = {"count": 0, "last_len": 0}
+            except OSError as e:
+                decky.logger.error("decky-QAM: cannot open %s: %s", path, e)
+        if not fdmap:
             return
         try:
             while not self._stop.is_set():
-                r, _, _ = select.select([fd], [], [], 0.2)
-                if not r:
-                    continue
-                try:
-                    report = os.read(fd, REPORT_LEN)
-                except BlockingIOError:
-                    continue
-                except OSError:
-                    break
-                if len(report) < REPORT_LEN:
-                    continue
-                # Keep only the button-bearing DeckState report.
-                if report[2] != DECK_STATE_REPORT_TYPE:
-                    continue
-                self._handle_report(report)
+                r, _, _ = select.select(list(fdmap.keys()), [], [], 0.2)
+                for fd in r:
+                    try:
+                        data = os.read(fd, 128)
+                    except BlockingIOError:
+                        continue
+                    except OSError:
+                        continue
+                    self._record(fdmap[fd], data)
+                    self._process(data)
+                self._capture_watchdog()
         finally:
-            os.close(fd)
+            for fd in fdmap:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
 
-    def _handle_report(self, report: bytes) -> None:
+    def _record(self, path: str, data: bytes) -> None:
+        s = self.stats.setdefault(path, {"count": 0, "last_len": 0})
+        s["count"] += 1
+        s["last_len"] = len(data)
+        if len(data) >= STATE_LEN and s["count"] % 30 == 1:
+            btn = " ".join(f"{b:02x}" for b in data[8:16])
+            self.recent.appendleft(
+                f"{os.path.basename(path)} len={len(data)} b2={data[2]:02x} btn[8:16]={btn}"
+            )
+
+    def _capture_watchdog(self) -> None:
+        with self._lock:
+            if (
+                self._capturing
+                and self._capture_reports == 0
+                and time.monotonic() - self._capture_start > 3.0
+            ):
+                self._capturing = False
+                self._capture_phase = ""
+                self._emit("qam_capture", {"phase": "nodata"})
+
+    def _process(self, data: bytes) -> None:
+        if len(data) < STATE_LEN:
+            return
         with self._lock:
             if self._capturing:
-                self._capture_step(report)
+                self._capture_reports += 1
+                self._capture_step(data)
                 return
             conditions = self.trigger
-
         if not conditions:
             return
-        pressed = report_matches(report, conditions)
+        pressed = report_matches(data, conditions)
         if pressed and not self.was_pressed:
             self._emit("qam_trigger")
         self.was_pressed = pressed
 
-    # Button bits live in a fixed window of the DeckState report. We diff
-    # against an idle baseline rather than trusting hard-coded offsets, but
-    # restrict to the button region so analog/gyro noise can't leak in.
-    BUTTON_REGION = range(8, 14)
-
-    def _report_bits(self, report: bytes) -> set[int]:
-        bits = set()
-        for idx in self.BUTTON_REGION:
-            byte = report[idx]
-            for bit in range(8):
-                if byte & (1 << bit):
-                    bits.add(idx * 8 + bit)
-        return bits
-
     def _capture_step(self, report: bytes) -> None:
         now = time.monotonic()
-        bits = self._report_bits(report)
+        bits = _region_bits(report)
+        all_bits = {idx * 8 + bit for idx in BUTTON_REGION for bit in range(8)}
 
         if self._capture_phase == "baseline":
-            # Bits that are 0 across the whole "hold still" window.
-            all_bits = {idx * 8 + bit for idx in self.BUTTON_REGION for bit in range(8)}
             if self._baseline_zero is None:
                 self._baseline_zero = all_bits - bits
             else:
                 self._baseline_zero -= bits
             if now >= self._phase_deadline:
                 self._capture_phase = "wait_press"
-                self._phase_deadline = now + 8.0  # user has 8s to press
+                self._phase_deadline = now + 8.0
                 self._emit("qam_capture", {"phase": "press"})
 
         elif self._capture_phase == "wait_press":
@@ -214,7 +260,7 @@ class HidListener:
             if new:
                 self._press_bits = set(new)
                 self._capture_phase = "confirm"
-                self._capture_samples = 0
+                self._confirm_samples = 0
                 self._phase_deadline = now + 0.4
             elif now >= self._phase_deadline:
                 self._capturing = False
@@ -222,17 +268,15 @@ class HidListener:
                 self._emit("qam_capture", {"phase": "timeout"})
 
         elif self._capture_phase == "confirm":
-            # Keep only bits held high for the whole confirm window.
             self._press_bits &= bits
-            self._capture_samples += 1
+            self._confirm_samples += 1
             if not self._press_bits:
-                # released too soon / noise - go back to waiting
                 self._capture_phase = "wait_press"
                 self._phase_deadline = now + 8.0
-            elif now >= self._phase_deadline and self._capture_samples >= 3:
+            elif now >= self._phase_deadline and self._confirm_samples >= 3:
                 conditions = self._bits_to_conditions(self._press_bits)
                 self.trigger = conditions
-                self.was_pressed = True  # avoid instant re-fire on release edge
+                self.was_pressed = True
                 self._capturing = False
                 self._capture_phase = ""
                 self._emit("qam_capture", {"phase": "done", "conditions": conditions})
@@ -272,13 +316,12 @@ class Plugin:
     # ---- frontend-callable methods --------------------------------------
 
     async def get_settings(self) -> dict:
-        device = find_deck_hidraw()
         return {
             "enabled": bool(self.settings.get("enabled", True)),
             "trigger": self.settings.get("trigger") or [],
             "label": self.settings.get("label") or "",
-            "device_found": device is not None,
-            "running": bool(self.listener._thread and self.listener._thread.is_alive()),
+            "device_found": len(find_valve_hidraw()) > 0,
+            "running": self.listener.is_running(),
         }
 
     async def set_enabled(self, enabled: bool) -> dict:
@@ -291,15 +334,18 @@ class Plugin:
         return await self.get_settings()
 
     async def begin_capture(self) -> bool:
-        # Listener must be running to read reports during capture.
-        if not (self.listener._thread and self.listener._thread.is_alive()):
-            if not self.listener.start():
-                return False
+        if not self.listener.start():
+            return False
         self.listener.begin_capture()
         return True
 
     async def cancel_capture(self) -> None:
         self.listener.cancel_capture()
+
+    async def get_diagnostics(self) -> dict:
+        self.listener.start()
+        await asyncio.sleep(1.2)
+        return self.listener.diagnostics()
 
     async def save_trigger(self, conditions: list, label: str) -> dict:
         self.settings["trigger"] = conditions
@@ -315,5 +361,4 @@ class Plugin:
         self.settings["label"] = ""
         save_settings(self.settings)
         self.listener.set_trigger([])
-        self.listener.stop()
         return await self.get_settings()

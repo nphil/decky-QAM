@@ -28,16 +28,22 @@ interface Settings {
   running: boolean;
 }
 
+interface Diagnostics {
+  devices: { path: string; reports: number; last_len: number }[];
+  recent: string[];
+  running: boolean;
+}
+
 const getSettings = callable<[], Settings>("get_settings");
 const setEnabledCall = callable<[boolean], Settings>("set_enabled");
 const beginCapture = callable<[], boolean>("begin_capture");
 const cancelCapture = callable<[], void>("cancel_capture");
 const saveTrigger = callable<[Condition[], string], Settings>("save_trigger");
 const clearTrigger = callable<[], Settings>("clear_trigger");
+const getDiagnostics = callable<[], Diagnostics>("get_diagnostics");
 
-// Open the Quick Access Menu. Navigation.OpenQuickAccessMenu is provided by
-// the Steam frontend (re-exported through @decky/ui) and works in-game too,
-// because this code runs in the always-loaded SharedJSContext.
+// Navigation.OpenQuickAccessMenu is provided by the Steam frontend and works
+// in-game because this code runs in the always-loaded SharedJSContext.
 function openQAM() {
   try {
     Navigation.OpenQuickAccessMenu();
@@ -56,6 +62,8 @@ function Content() {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [capturing, setCapturing] = useState(false);
   const [captureMsg, setCaptureMsg] = useState("");
+  const [diag, setDiag] = useState<Diagnostics | null>(null);
+  const [diagBusy, setDiagBusy] = useState(false);
 
   const refresh = async () => setSettings(await getSettings());
 
@@ -69,6 +77,11 @@ function Content() {
       } else if (phase === "timeout") {
         setCapturing(false);
         setCaptureMsg("No button detected. Try again and hold it firmly.");
+      } else if (phase === "nodata") {
+        setCapturing(false);
+        setCaptureMsg(
+          "No controller data received. Run Diagnostics below to see what's detected.",
+        );
       } else if (phase === "done") {
         const conditions: Condition[] = payload.conditions || [];
         saveTrigger(conditions, describe(conditions)).then((s) => {
@@ -99,6 +112,16 @@ function Content() {
     setCaptureMsg("");
   };
 
+  const runDiagnostics = async () => {
+    setDiagBusy(true);
+    setDiag(null);
+    try {
+      setDiag(await getDiagnostics());
+    } finally {
+      setDiagBusy(false);
+    }
+  };
+
   if (!settings) {
     return (
       <PanelSection>
@@ -114,7 +137,6 @@ function Content() {
           <ToggleField
             label="Enabled"
             checked={settings.enabled}
-            disabled={!settings.trigger.length}
             onChange={async (v) => setSettings(await setEnabledCall(v))}
           />
         </PanelSectionRow>
@@ -168,7 +190,27 @@ function Content() {
         {!settings.device_found ? (
           <PanelSectionRow>
             <div style={{ fontSize: "0.8em", color: "#ffae42" }}>
-              Steam Deck controller not detected. Button binding will not work.
+              No Valve HID device detected. Button binding will not work.
+            </div>
+          </PanelSectionRow>
+        ) : null}
+      </PanelSection>
+
+      <PanelSection title="Diagnostics">
+        <PanelSectionRow>
+          <ButtonItem layout="below" disabled={diagBusy} onClick={runDiagnostics}>
+            {diagBusy ? "Reading controller..." : "Run diagnostics"}
+          </ButtonItem>
+        </PanelSectionRow>
+        {diag ? (
+          <PanelSectionRow>
+            <div style={{ fontSize: "0.7em", opacity: 0.9, whiteSpace: "pre-wrap" }}>
+              {diag.devices.length
+                ? diag.devices
+                    .map((d) => `${d.path}: ${d.reports} reports, len ${d.last_len}`)
+                    .join("\n")
+                : "No Valve HID nodes found."}
+              {diag.recent.length ? "\n\n" + diag.recent.join("\n") : ""}
             </div>
           </PanelSectionRow>
         ) : null}
